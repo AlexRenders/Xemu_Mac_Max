@@ -761,7 +761,9 @@ static void apply_uniform_updates(const UniformInfo *info, int *locs,
         }
     }
 
-    assert(glGetError() == GL_NO_ERROR);
+    /* glGetError flushes Apple's OpenGL command stream. This runs once per
+     * draw, so the GPU finishes every draw before the next one is submitted
+     * and resolution stops mattering. */
 }
 
 // FIXME: Dirty tracking

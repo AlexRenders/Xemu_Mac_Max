@@ -65,6 +65,8 @@ typedef struct PshState {
     enum PshAlphaFunc alpha_func;
 
     bool window_clip_exclusive;
+    /* Inclusive clip covers the surface, so the shader must not discard. */
+    bool window_clip_trivial;
 
     bool smooth_shading;
     bool depth_clipping;

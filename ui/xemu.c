@@ -833,6 +833,25 @@ static void gl_render_frame(struct xemu_console *scon)
         return;
     }
 
+    /* With vsync off this loop otherwise copies the guest framebuffer on
+     * every iteration. Each copy waits for the GPU, so the game's draws
+     * never get the machine to themselves and the frame time jumps around.
+     * The guest only produces a new image on its 60Hz vblank. */
+    if (!g_config.display.window.vsync) {
+        static Uint64 next_present_ms;
+        Uint64 now = SDL_GetTicks();
+        if (now < next_present_ms) {
+            Uint64 wait = next_present_ms - now;
+            if (wait > 16) {
+                wait = 16;
+            }
+            qatomic_set(&rendering, false);
+            SDL_Delay((Uint32)wait);
+            return;
+        }
+        next_present_ms = now + 16;
+    }
+
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
     bool flip_required = false;

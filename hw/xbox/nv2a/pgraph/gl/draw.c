@@ -208,10 +208,26 @@ void pgraph_gl_draw_begin(NV2AState *d)
                     & NV_PGRAPH_SETUPRASTER_FRONTFACE
                         ? GL_CW : GL_CCW);
 
-    /* Polygon offset is handled in geometry and fragment shaders explicitly */
+    /* Accurate depth applies polygon offset in the fragment shader. Fast
+     * depth does not write gl_FragDepth, so the offset has to be fixed
+     * function or decals z-fight. */
     glDisable(GL_POLYGON_OFFSET_FILL);
     glDisable(GL_POLYGON_OFFSET_LINE);
     glDisable(GL_POLYGON_OFFSET_POINT);
+    if (pgraph_glsl_use_fast_depth(pg)) {
+        uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+        uint32_t polygon_mode =
+            GET_MASK(raster, NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+        if (polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_FILL &&
+            (raster & NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE)) {
+            uint32_t zbias_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS);
+            uint32_t zfactor_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETFACTOR);
+            float zbias = *(float *)&zbias_u32;
+            float zfactor = *(float *)&zfactor_u32;
+            glPolygonOffset(zfactor, zbias);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+        }
+    }
 
     /* Depth testing */
     if (depth_test) {

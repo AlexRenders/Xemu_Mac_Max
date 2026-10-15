@@ -75,6 +75,13 @@ package_macos() {
     plutil -replace CFBundleShortVersionString -string "${xemu_version}" dist/xemu.app/Contents/Info.plist
     plutil -replace CFBundleVersion            -string "${xemu_version}" dist/xemu.app/Contents/Info.plist
 
+    # dylibbundler can record the same rpath twice, and dyld aborts on that.
+    rpath='@executable_path/'"${lib_rpath}"'/'
+    rpath_count=$(otool -l "${exe_path}" | grep -c "${rpath}" || true)
+    if [[ "${rpath_count}" -gt 1 ]]; then
+      install_name_tool -delete_rpath "${rpath}" "${exe_path}"
+    fi
+
     codesign --force --deep --preserve-metadata=entitlements,requirements,flags,runtime --sign - "${exe_path}"
     python3 ./scripts/gen-license.py --version-file=macos-libs/$target_arch/INSTALLED > dist/LICENSE.txt
 }
@@ -265,6 +272,9 @@ set -x # Print commands from now on
     --target-list=i386-softmmu \
     ${opts} \
     "$@"
+
+# gen_config needs PyYAML. configure recreates this venv and does not install it.
+"${project_source_dir}/build/pyvenv/bin/python3" -m pip install pyyaml
 
 time make -j"${job_count}" ${target} 2>&1 | tee build.log
 

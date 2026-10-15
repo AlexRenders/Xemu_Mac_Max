@@ -51,6 +51,24 @@ static uint32_t get_colorkey_mask(unsigned int color_format)
     }
 }
 
+static void pgraph_glsl_window_clip_rect(PGRAPHState *pg, int i,
+                                         unsigned int *x_min, unsigned int *y_min,
+                                         unsigned int *x_max, unsigned int *y_max)
+{
+    uint32_t x = pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPX0 + i * 4);
+    *x_min = GET_MASK(x, NV_PGRAPH_WINDOWCLIPX0_XMIN);
+    *x_max = GET_MASK(x, NV_PGRAPH_WINDOWCLIPX0_XMAX) + 1;
+
+    uint32_t y = pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPY0 + i * 4);
+    *y_min = GET_MASK(y, NV_PGRAPH_WINDOWCLIPY0_YMIN);
+    *y_max = GET_MASK(y, NV_PGRAPH_WINDOWCLIPY0_YMAX) + 1;
+
+    pgraph_apply_anti_aliasing_factor(pg, x_min, y_min);
+    pgraph_apply_anti_aliasing_factor(pg, x_max, y_max);
+    pgraph_apply_scaling_factor(pg, x_min, y_min);
+    pgraph_apply_scaling_factor(pg, x_max, y_max);
+}
+
 static uint32_t get_color_key_mask_for_texture(PGRAPHState *pg, int i)
 {
     assert(i < NV2A_MAX_TEXTURES);
@@ -88,6 +106,24 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
                             NV_PGRAPH_CONTROL_3_SHADEMODE_SMOOTH;
 
     state->fast_depth = pgraph_glsl_use_fast_depth(pg);
+
+    state->window_clip_trivial = false;
+    if (state->fast_depth && !state->window_clip_exclusive &&
+        pg->surface_binding_dim.width > 0 &&
+        pg->surface_binding_dim.height > 0) {
+        unsigned int surf_w = pg->surface_binding_dim.width;
+        unsigned int surf_h = pg->surface_binding_dim.height;
+        pgraph_apply_anti_aliasing_factor(pg, &surf_w, &surf_h);
+        pgraph_apply_scaling_factor(pg, &surf_w, &surf_h);
+        for (int i = 0; i < 8; i++) {
+            unsigned int x_min, y_min, x_max, y_max;
+            pgraph_glsl_window_clip_rect(pg, i, &x_min, &y_min, &x_max, &y_max);
+            if (x_min == 0 && y_min == 0 && x_max >= surf_w && y_max >= surf_h) {
+                state->window_clip_trivial = true;
+                break;
+            }
+        }
+    }
 
     state->depth_clipping =
         GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ZCOMPRESSOCCLUDE),
@@ -980,25 +1016,15 @@ static MString* psh_convert(struct PixelShader *ps)
 
     MString *clip = mstring_new();
 
-    /* Polygon-offset slope. The geometry shader computes it as triMZ. Without
-     * that shader, screen-space derivatives stand in. They have to be taken
-     * before the window-clip discard, which is non-uniform. */
+    /* Fast depth keeps the rasterizer's depth. Writing gl_FragDepth, or
+     * discarding for a clip that never rejects, turns early-Z off. */
     if (!ps->state->fast_depth) {
         mstring_append(clip, "float depthSlope = triMZ;\n");
-    } else if (ps->state->z_perspective) {
-        mstring_append(
-            clip,
-            "float depthSlope = max(\n"
-            "  abs(dFdx(gl_FragCoord.w)) * float(surfaceScale.x),\n"
-            "  abs(dFdy(gl_FragCoord.w)) * float(surfaceScale.y));\n");
-    } else {
-        mstring_append(
-            clip,
-            "float depthSlope = clipRange.y * max(\n"
-            "  abs(dFdx(gl_FragCoord.z)) * float(surfaceScale.x),\n"
-            "  abs(dFdy(gl_FragCoord.z)) * float(surfaceScale.y));\n");
     }
 
+    if (ps->state->fast_depth && ps->state->window_clip_trivial) {
+        mstring_append(clip, "/* Window clip covers the surface */\n");
+    } else {
     mstring_append_fmt(clip, "/*  Window-clip (%slusive) */\n",
                        ps->state->window_clip_exclusive ? "Exc" : "Inc");
     if (!ps->state->window_clip_exclusive) {
@@ -1023,10 +1049,9 @@ static MString* psh_convert(struct PixelShader *ps)
                              "  discard;\n"
                              "}\n");
     }
+    }
 
-    if (ps->state->z_perspective && ps->state->fast_depth) {
-        mstring_append(clip, "precise float zvalue = 1.0 / gl_FragCoord.w;\n");
-    } else if (ps->state->z_perspective) {
+    if (!ps->state->fast_depth && ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
@@ -1045,10 +1070,7 @@ static MString* psh_convert(struct PixelShader *ps)
             "bc1 *= inv_bcsum;\n"
             "bc2 *= inv_bcsum;\n"
             "precise float zvalue = vtxPos0.w + (bc1*(vtxPos1.w - vtxPos0.w) + bc2*(vtxPos2.w - vtxPos0.w));\n");
-    } else if (ps->state->fast_depth) {
-        mstring_append(
-            clip, "precise float zvalue = gl_FragCoord.z * clipRange.y;\n");
-    } else {
+    } else if (!ps->state->fast_depth) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
@@ -1066,7 +1088,7 @@ static MString* psh_convert(struct PixelShader *ps)
             "precise float zvalue = vtxPos0.z + (bc1*(vtxPos1.z - vtxPos0.z) + bc2*(vtxPos2.z - vtxPos0.z));\n");
     }
 
-    if (ps->state->z_perspective) {
+    if (!ps->state->fast_depth && ps->state->z_perspective) {
         mstring_append(
             clip,
             // If GPU clipping is inaccurate, the point gl_FragCoord.xy might
@@ -1084,18 +1106,19 @@ static MString* psh_convert(struct PixelShader *ps)
             "if (isnan(zvalue)) {\n"
             "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
             "}\n");
-    } else {
+    } else if (!ps->state->fast_depth) {
         mstring_append(clip, "zvalue += depthOffset;\n"
                              "zvalue += depthFactor*depthSlope;\n");
     }
 
-    /* Depth clipping */
-    if (ps->state->depth_clipping) {
+    /* Depth clipping. Fast depth uses the rasterizer depth and GL_DEPTH_CLAMP
+     * instead, so this discard cannot disable early-Z. */
+    if (!ps->state->fast_depth && ps->state->depth_clipping) {
         mstring_append(
             clip, "if (zvalue < clipRange.z || clipRange.w < zvalue) {\n"
                   "  discard;\n"
                   "}\n");
-    } else {
+    } else if (!ps->state->fast_depth) {
         mstring_append(
             clip, "zvalue = clamp(zvalue, clipRange.z, clipRange.w);\n");
     }
@@ -1532,23 +1555,25 @@ static MString* psh_convert(struct PixelShader *ps)
      * due to rounding.)
      */
 
-    switch (ps->state->depth_format) {
-    case DEPTH_FORMAT_D16:
-        // 16-bit unsigned int
-        mstring_append(
-            ps->code,
-            "gl_FragDepth = floor(zvalue) / 65535.0;\n");
-        break;
-    case DEPTH_FORMAT_D24:
-        // 24-bit unsigned int
-        mstring_append(
-            ps->code,
-            "gl_FragDepth = uintBitsToFloat(floatBitsToUint(floor(zvalue) / 16777216.0) + 1u);\n");
-        break;
-    default:
-        // TODO: handle floating-point depth buffers properly
-        mstring_append(ps->code, "gl_FragDepth = zvalue / clipRange.y;\n");
-        break;
+    if (!ps->state->fast_depth) {
+        switch (ps->state->depth_format) {
+        case DEPTH_FORMAT_D16:
+            // 16-bit unsigned int
+            mstring_append(
+                ps->code,
+                "gl_FragDepth = floor(zvalue) / 65535.0;\n");
+            break;
+        case DEPTH_FORMAT_D24:
+            // 24-bit unsigned int
+            mstring_append(
+                ps->code,
+                "gl_FragDepth = uintBitsToFloat(floatBitsToUint(floor(zvalue) / 16777216.0) + 1u);\n");
+            break;
+        default:
+            // TODO: handle floating-point depth buffers properly
+            mstring_append(ps->code, "gl_FragDepth = zvalue / clipRange.y;\n");
+            break;
+        }
     }
 
     MString *final = mstring_new();
@@ -1803,20 +1828,8 @@ void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
     pgraph_apply_scaling_factor(pg, &max_gl_width, &max_gl_height);
 
     for (int i = 0; i < 8; i++) {
-        uint32_t x = pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPX0 + i * 4);
-        unsigned int x_min = GET_MASK(x, NV_PGRAPH_WINDOWCLIPX0_XMIN);
-        unsigned int x_max = GET_MASK(x, NV_PGRAPH_WINDOWCLIPX0_XMAX) + 1;
-
-        uint32_t y = pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPY0 + i * 4);
-        unsigned int y_min = GET_MASK(y, NV_PGRAPH_WINDOWCLIPY0_YMIN);
-        unsigned int y_max = GET_MASK(y, NV_PGRAPH_WINDOWCLIPY0_YMAX) + 1;
-
-        pgraph_apply_anti_aliasing_factor(pg, &x_min, &y_min);
-        pgraph_apply_anti_aliasing_factor(pg, &x_max, &y_max);
-
-        pgraph_apply_scaling_factor(pg, &x_min, &y_min);
-        pgraph_apply_scaling_factor(pg, &x_max, &y_max);
-
+        unsigned int x_min, y_min, x_max, y_max;
+        pgraph_glsl_window_clip_rect(pg, i, &x_min, &y_min, &x_max, &y_max);
         values->clipRegion[i][0] = x_min;
         values->clipRegion[i][1] = y_min;
         values->clipRegion[i][2] = x_max;
