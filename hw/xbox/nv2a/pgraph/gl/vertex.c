@@ -85,8 +85,17 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         VertexAttribute *attr = &pg->vertex_attributes[i];
 
         if (!attr->count) {
+            if (r->attrib[i].set && !r->attrib[i].enabled &&
+                memcmp(r->attrib[i].generic, attr->inline_value,
+                       sizeof(r->attrib[i].generic)) == 0) {
+                continue;
+            }
             glDisableVertexAttribArray(i);
             glVertexAttrib4fv(i, attr->inline_value);
+            r->attrib[i].set = true;
+            r->attrib[i].enabled = false;
+            memcpy(r->attrib[i].generic, attr->inline_value,
+                   sizeof(r->attrib[i].generic));
             continue;
         }
 
@@ -174,8 +183,31 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             // Stride of 0 indicates that only the first element should be
             // used.
             pgraph_update_inline_value(attr, last_entry);
-            glDisableVertexAttribArray(i);
-            glVertexAttrib4fv(i, attr->inline_value);
+            if (!(r->attrib[i].set && !r->attrib[i].enabled &&
+                  memcmp(r->attrib[i].generic, attr->inline_value,
+                         sizeof(r->attrib[i].generic)) == 0)) {
+                glDisableVertexAttribArray(i);
+                glVertexAttrib4fv(i, attr->inline_value);
+                r->attrib[i].set = true;
+                r->attrib[i].enabled = false;
+                memcpy(r->attrib[i].generic, attr->inline_value,
+                       sizeof(r->attrib[i].generic));
+            }
+            continue;
+        }
+
+        GLuint attrib_buffer = inline_data ? r->gl_inline_array_buffer
+                                           : r->gl_memory_buffer;
+        if (r->attrib[i].set && r->attrib[i].enabled &&
+            r->attrib[i].integer == needs_conversion &&
+            r->attrib[i].size == gl_count &&
+            r->attrib[i].type == gl_type &&
+            r->attrib[i].normalized == gl_normalize &&
+            r->attrib[i].stride == (GLsizei)stride &&
+            r->attrib[i].offset == (uintptr_t)attrib_data_addr &&
+            r->attrib[i].buffer == attrib_buffer) {
+            last_entry += stride * provoking_element_index;
+            pgraph_update_inline_value(attr, last_entry);
             continue;
         }
 
@@ -188,6 +220,15 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         }
 
         glEnableVertexAttribArray(i);
+        r->attrib[i].set = true;
+        r->attrib[i].enabled = true;
+        r->attrib[i].integer = needs_conversion;
+        r->attrib[i].size = gl_count;
+        r->attrib[i].type = gl_type;
+        r->attrib[i].normalized = gl_normalize;
+        r->attrib[i].stride = stride;
+        r->attrib[i].offset = attrib_data_addr;
+        r->attrib[i].buffer = attrib_buffer;
         last_entry += stride * provoking_element_index;
         pgraph_update_inline_value(attr, last_entry);
     }

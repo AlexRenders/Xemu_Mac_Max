@@ -118,6 +118,7 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     glClear(gl_mask);
 
     glDisable(GL_SCISSOR_TEST);
+    r->fixed.known = false;
 
     pgraph_gl_set_surface_dirty(pg, write_color, write_zeta);
 
@@ -129,6 +130,27 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     }
     
     pg->clearing = false;
+}
+
+static bool fixed_changed(void *slot, const void *value, size_t bytes, bool known)
+{
+    if (known && memcmp(slot, value, bytes) == 0) {
+        return false;
+    }
+    memcpy(slot, value, bytes);
+    return true;
+}
+
+static void fixed_enable(bool *slot, bool enable, GLenum cap, bool known)
+{
+    if (!fixed_changed(slot, &enable, sizeof(enable), known)) {
+        return;
+    }
+    if (enable) {
+        glEnable(cap);
+    } else {
+        glDisable(cap);
+    }
 }
 
 void pgraph_gl_draw_begin(NV2AState *d)
@@ -160,95 +182,131 @@ void pgraph_gl_draw_begin(NV2AState *d)
     pgraph_gl_bind_textures(d);
     pgraph_gl_bind_shaders(pg);
 
-    glColorMask(mask_red, mask_green, mask_blue, mask_alpha);
-    glDepthMask(!!(control_0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE));
-    glStencilMask(GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1),
-                           NV_PGRAPH_CONTROL_1_STENCIL_MASK_WRITE));
+    bool known = r->fixed.known;
+    bool maskb[4] = { mask_red, mask_green, mask_blue, mask_alpha };
+    if (fixed_changed(r->fixed.color_mask, maskb, sizeof(maskb), known)) {
+        glColorMask(mask_red, mask_green, mask_blue, mask_alpha);
+    }
+    bool depth_write = !!(control_0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE);
+    if (fixed_changed(&r->fixed.depth_mask, &depth_write, sizeof(depth_write),
+                      known)) {
+        glDepthMask(depth_write);
+    }
+    GLuint stencil_write_mask = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1),
+                                         NV_PGRAPH_CONTROL_1_STENCIL_MASK_WRITE);
+    if (fixed_changed(&r->fixed.stencil_mask, &stencil_write_mask,
+                      sizeof(stencil_write_mask), known)) {
+        glStencilMask(stencil_write_mask);
+    }
 
-    if (pgraph_reg_r(pg, NV_PGRAPH_BLEND) & NV_PGRAPH_BLEND_EN) {
-        glEnable(GL_BLEND);
+    bool blend = pgraph_reg_r(pg, NV_PGRAPH_BLEND) & NV_PGRAPH_BLEND_EN;
+    fixed_enable(&r->fixed.blend, blend, GL_BLEND, known);
+    if (blend) {
         uint32_t sfactor = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_BLEND),
                                     NV_PGRAPH_BLEND_SFACTOR);
         uint32_t dfactor = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_BLEND),
                                     NV_PGRAPH_BLEND_DFACTOR);
         assert(sfactor < ARRAY_SIZE(pgraph_blend_factor_gl_map));
         assert(dfactor < ARRAY_SIZE(pgraph_blend_factor_gl_map));
-        glBlendFunc(pgraph_blend_factor_gl_map[sfactor],
-                    pgraph_blend_factor_gl_map[dfactor]);
+        GLenum blend_sf = pgraph_blend_factor_gl_map[sfactor];
+        GLenum blend_df = pgraph_blend_factor_gl_map[dfactor];
+        if (fixed_changed(&r->fixed.blend_sfactor, &blend_sf, sizeof(blend_sf),
+                          known) ||
+            fixed_changed(&r->fixed.blend_dfactor, &blend_df, sizeof(blend_df),
+                          known)) {
+            glBlendFunc(blend_sf, blend_df);
+        }
 
         uint32_t equation = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_BLEND),
                                      NV_PGRAPH_BLEND_EQN);
         assert(equation < ARRAY_SIZE(pgraph_blend_equation_gl_map));
-        glBlendEquation(pgraph_blend_equation_gl_map[equation]);
+        GLenum blend_eq = pgraph_blend_equation_gl_map[equation];
+        if (fixed_changed(&r->fixed.blend_equation, &blend_eq, sizeof(blend_eq),
+                          known)) {
+            glBlendEquation(blend_eq);
+        }
 
         uint32_t blend_color = pgraph_reg_r(pg, NV_PGRAPH_BLENDCOLOR);
         float gl_blend_color[4];
         pgraph_argb_pack32_to_rgba_float(blend_color, gl_blend_color);
-        glBlendColor(gl_blend_color[0], gl_blend_color[1], gl_blend_color[2],
-                     gl_blend_color[3]);
-    } else {
-        glDisable(GL_BLEND);
+        if (fixed_changed(r->fixed.blend_color, gl_blend_color,
+                          sizeof(gl_blend_color), known)) {
+            glBlendColor(gl_blend_color[0], gl_blend_color[1],
+                         gl_blend_color[2], gl_blend_color[3]);
+        }
     }
 
-    /* Face culling */
-    if (pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER)
-            & NV_PGRAPH_SETUPRASTER_CULLENABLE) {
-        uint32_t cull_face = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
-                                      NV_PGRAPH_SETUPRASTER_CULLCTRL);
+    uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+    bool cull = raster & NV_PGRAPH_SETUPRASTER_CULLENABLE;
+    fixed_enable(&r->fixed.cull, cull, GL_CULL_FACE, known);
+    if (cull) {
+        uint32_t cull_face = GET_MASK(raster, NV_PGRAPH_SETUPRASTER_CULLCTRL);
         assert(cull_face < ARRAY_SIZE(pgraph_cull_face_gl_map));
-        glCullFace(pgraph_cull_face_gl_map[cull_face]);
-        glEnable(GL_CULL_FACE);
-    } else {
-        glDisable(GL_CULL_FACE);
+        GLenum cull_mode = pgraph_cull_face_gl_map[cull_face];
+        if (fixed_changed(&r->fixed.cull_face, &cull_mode, sizeof(cull_mode),
+                          known)) {
+            glCullFace(cull_mode);
+        }
     }
 
-    /* Front-face select */
     /* Winding is reverse here because clip-space y-coordinates are inverted */
-    glFrontFace(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER)
-                    & NV_PGRAPH_SETUPRASTER_FRONTFACE
-                        ? GL_CW : GL_CCW);
+    GLenum front_face = raster & NV_PGRAPH_SETUPRASTER_FRONTFACE ? GL_CW
+                                                                 : GL_CCW;
+    if (fixed_changed(&r->fixed.front_face, &front_face, sizeof(front_face),
+                      known)) {
+        glFrontFace(front_face);
+    }
 
     /* Accurate depth applies polygon offset in the fragment shader. Fast
      * depth does not write gl_FragDepth, so the offset has to be fixed
      * function or decals z-fight. */
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glDisable(GL_POLYGON_OFFSET_LINE);
-    glDisable(GL_POLYGON_OFFSET_POINT);
+    bool offset_fill = false;
+    float offset_factor = 0.0f;
+    float offset_units = 0.0f;
     if (pgraph_glsl_use_fast_depth(pg)) {
-        uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
         uint32_t polygon_mode =
             GET_MASK(raster, NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
         if (polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_FILL &&
             (raster & NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE)) {
             uint32_t zbias_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS);
             uint32_t zfactor_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETFACTOR);
-            float zbias = *(float *)&zbias_u32;
-            float zfactor = *(float *)&zfactor_u32;
-            glPolygonOffset(zfactor, zbias);
-            glEnable(GL_POLYGON_OFFSET_FILL);
+            offset_units = *(float *)&zbias_u32;
+            offset_factor = *(float *)&zfactor_u32;
+            offset_fill = true;
+        }
+    }
+    fixed_enable(&r->fixed.offset_line, false, GL_POLYGON_OFFSET_LINE, known);
+    fixed_enable(&r->fixed.offset_point, false, GL_POLYGON_OFFSET_POINT, known);
+    fixed_enable(&r->fixed.offset_fill, offset_fill, GL_POLYGON_OFFSET_FILL,
+                 known);
+    if (offset_fill &&
+        (fixed_changed(&r->fixed.offset_factor, &offset_factor,
+                       sizeof(offset_factor), known) ||
+         fixed_changed(&r->fixed.offset_units, &offset_units,
+                       sizeof(offset_units), known))) {
+        glPolygonOffset(offset_factor, offset_units);
+    }
+
+    fixed_enable(&r->fixed.depth_test, depth_test, GL_DEPTH_TEST, known);
+    if (depth_test) {
+        uint32_t depth_func = GET_MASK(control_0, NV_PGRAPH_CONTROL_0_ZFUNC);
+        assert(depth_func < ARRAY_SIZE(pgraph_depth_func_gl_map));
+        GLenum depth_mode = pgraph_depth_func_gl_map[depth_func];
+        if (fixed_changed(&r->fixed.depth_func, &depth_mode, sizeof(depth_mode),
+                          known)) {
+            glDepthFunc(depth_mode);
         }
     }
 
-    /* Depth testing */
-    if (depth_test) {
-        glEnable(GL_DEPTH_TEST);
-
-        uint32_t depth_func = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
-                                       NV_PGRAPH_CONTROL_0_ZFUNC);
-        assert(depth_func < ARRAY_SIZE(pgraph_depth_func_gl_map));
-        glDepthFunc(pgraph_depth_func_gl_map[depth_func]);
-    } else {
-        glDisable(GL_DEPTH_TEST);
+    fixed_enable(&r->fixed.depth_clamp, true, GL_DEPTH_CLAMP, known);
+    bool provoking_first = true;
+    if (fixed_changed(&r->fixed.provoking_first, &provoking_first,
+                      sizeof(provoking_first), known)) {
+        glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
     }
 
-    glEnable(GL_DEPTH_CLAMP);
-
-    /* Set first vertex convention to match Vulkan default */
-    glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
-
+    fixed_enable(&r->fixed.stencil_test, stencil_test, GL_STENCIL_TEST, known);
     if (stencil_test) {
-        glEnable(GL_STENCIL_TEST);
-
         uint32_t stencil_func = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1),
                                     NV_PGRAPH_CONTROL_1_STENCIL_FUNC);
         uint32_t stencil_ref = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1),
@@ -267,59 +325,62 @@ void pgraph_gl_draw_begin(NV2AState *d)
         assert(op_zfail < ARRAY_SIZE(pgraph_stencil_op_gl_map));
         assert(op_zpass < ARRAY_SIZE(pgraph_stencil_op_gl_map));
 
-        glStencilFunc(
-            pgraph_stencil_func_gl_map[stencil_func],
-            stencil_ref,
-            func_mask);
+        GLenum sfunc = pgraph_stencil_func_gl_map[stencil_func];
+        GLint sref = stencil_ref;
+        GLuint smask = func_mask;
+        if (fixed_changed(&r->fixed.stencil_func, &sfunc, sizeof(sfunc), known) ||
+            fixed_changed(&r->fixed.stencil_ref, &sref, sizeof(sref), known) ||
+            fixed_changed(&r->fixed.stencil_read_mask, &smask, sizeof(smask),
+                          known)) {
+            glStencilFunc(sfunc, sref, smask);
+        }
 
-        glStencilOp(
-            pgraph_stencil_op_gl_map[op_fail],
-            pgraph_stencil_op_gl_map[op_zfail],
-            pgraph_stencil_op_gl_map[op_zpass]);
-
-    } else {
-        glDisable(GL_STENCIL_TEST);
+        GLenum fail = pgraph_stencil_op_gl_map[op_fail];
+        GLenum zfail = pgraph_stencil_op_gl_map[op_zfail];
+        GLenum zpass = pgraph_stencil_op_gl_map[op_zpass];
+        if (fixed_changed(&r->fixed.stencil_fail, &fail, sizeof(fail), known) ||
+            fixed_changed(&r->fixed.stencil_zfail, &zfail, sizeof(zfail), known) ||
+            fixed_changed(&r->fixed.stencil_zpass, &zpass, sizeof(zpass),
+                          known)) {
+            glStencilOp(fail, zfail, zpass);
+        }
     }
 
-    /* Dither */
-    /* FIXME: GL implementation dependent */
-    if (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
-            NV_PGRAPH_CONTROL_0_DITHERENABLE) {
-        glEnable(GL_DITHER);
-    } else {
-        glDisable(GL_DITHER);
-    }
+    /* Dither is GL-implementation dependent. */
+    bool dither = control_0 & NV_PGRAPH_CONTROL_0_DITHERENABLE;
+    fixed_enable(&r->fixed.dither, dither, GL_DITHER, known);
+    fixed_enable(&r->fixed.program_point_size, true, GL_PROGRAM_POINT_SIZE,
+                 known);
 
-    glEnable(GL_PROGRAM_POINT_SIZE);
-
-    bool anti_aliasing = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING), NV_PGRAPH_ANTIALIASING_ENABLE);
-
-    /* Edge Antialiasing */
-    if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
-                              NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE) {
-        glEnable(GL_LINE_SMOOTH);
-        glLineWidth(MIN(r->supported_smooth_line_width_range[1], pg->surface_scale_factor));
-    } else {
-        glDisable(GL_LINE_SMOOTH);
-        glLineWidth(MIN(r->supported_aliased_line_width_range[1], pg->surface_scale_factor));
+    bool anti_aliasing = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING),
+                                  NV_PGRAPH_ANTIALIASING_ENABLE);
+    bool line_smooth = !anti_aliasing &&
+                       (raster & NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE);
+    fixed_enable(&r->fixed.line_smooth, line_smooth, GL_LINE_SMOOTH, known);
+    float line_width = MIN(line_smooth ? r->supported_smooth_line_width_range[1]
+                                       : r->supported_aliased_line_width_range[1],
+                           pg->surface_scale_factor);
+    if (fixed_changed(&r->fixed.line_width, &line_width, sizeof(line_width),
+                      known)) {
+        glLineWidth(line_width);
     }
-    if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
-                              NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE) {
-        glEnable(GL_POLYGON_SMOOTH);
-    } else {
-        glDisable(GL_POLYGON_SMOOTH);
-    }
+    bool polygon_smooth = !anti_aliasing &&
+                          (raster & NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE);
+    fixed_enable(&r->fixed.polygon_smooth, polygon_smooth, GL_POLYGON_SMOOTH,
+                 known);
 
     unsigned int vp_width = pg->surface_binding_dim.width,
                  vp_height = pg->surface_binding_dim.height;
     pgraph_apply_scaling_factor(pg, &vp_width, &vp_height);
-    glViewport(0, 0, vp_width, vp_height);
+    GLint viewport[4] = { 0, 0, vp_width, vp_height };
+    if (fixed_changed(r->fixed.viewport, viewport, sizeof(viewport), known)) {
+        glViewport(0, 0, vp_width, vp_height);
+    }
 
     /* Surface clip */
     /* FIXME: Consider moving to PSH w/ window clip */
     unsigned int xmin = pg->surface_shape.clip_x,
                  ymin = pg->surface_shape.clip_y;
-
     unsigned int scissor_width = pg->surface_shape.clip_width,
                  scissor_height = pg->surface_shape.clip_height;
 
@@ -328,8 +389,12 @@ void pgraph_gl_draw_begin(NV2AState *d)
     pgraph_apply_scaling_factor(pg, &xmin, &ymin);
     pgraph_apply_scaling_factor(pg, &scissor_width, &scissor_height);
 
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(xmin, ymin, scissor_width, scissor_height);
+    fixed_enable(&r->fixed.scissor_test, true, GL_SCISSOR_TEST, known);
+    GLint scissor[4] = { xmin, ymin, scissor_width, scissor_height };
+    if (fixed_changed(r->fixed.scissor, scissor, sizeof(scissor), known)) {
+        glScissor(xmin, ymin, scissor_width, scissor_height);
+    }
+    r->fixed.known = true;
 
     /* Visibility testing */
     if (pg->zpass_pixel_count_enable) {
@@ -488,6 +553,10 @@ void pgraph_gl_flush_draw(NV2AState *d)
                 glDisableVertexAttribArray(i);
                 glVertexAttrib4fv(i, attr->inline_value);
             }
+            /* This path writes the render VAO directly. The attribute shadow
+             * would otherwise skip the next real mesh and leave these bindings
+             * in place. */
+            r->attrib[i].set = false;
         }
 
         glDrawArrays(r->shader_binding->gl_primitive_mode,

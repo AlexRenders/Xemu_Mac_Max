@@ -429,12 +429,34 @@ int pgraph_gl_get_framebuffer_surface(NV2AState *d)
         || surface->fmt.gl_format == GL_BGRA
         );
 
+    /* The guest only publishes a new image when it flips. Copying on every
+     * window refresh fences the render queue in the middle of the next frame,
+     * so a frame that would have fit in one vblank spills into the next. */
+    int flip = pg->frame_time;
+    hwaddr scanout = d->pcrtc.start + vga_display_params.line_offset;
+    unsigned int width = surface->width;
+    unsigned int height = surface->height;
+    if (r->display_cache_valid && r->gl_display_buffer &&
+        r->display_cache_flip == flip &&
+        r->display_cache_addr == scanout &&
+        r->display_cache_width == width &&
+        r->display_cache_height == height) {
+        qemu_mutex_unlock(&d->pfifo.lock);
+        return r->gl_display_buffer;
+    }
+
     surface->frame_time = pg->frame_time;
     qemu_event_reset(&d->pgraph.sync_complete);
     qatomic_set(&pg->sync_pending, true);
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);
     qemu_event_wait(&d->pgraph.sync_complete);
+
+    r->display_cache_valid = r->gl_display_buffer != 0;
+    r->display_cache_flip = flip;
+    r->display_cache_addr = scanout;
+    r->display_cache_width = width;
+    r->display_cache_height = height;
 
     return r->gl_display_buffer;
 }

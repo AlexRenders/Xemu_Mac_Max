@@ -120,6 +120,8 @@ typedef struct ShaderBinding {
 
     GLuint gl_program;
     GLenum gl_primitive_mode;
+    /* Last values sent to this program. NULL until the first draw. */
+    void *uniform_cache;
 
     struct {
         PshUniformLocs psh;
@@ -175,6 +177,13 @@ typedef struct PGRAPHGLState {
     GLsizei gl_display_buffer_height;
     GLenum gl_display_buffer_format;
     GLenum gl_display_buffer_type;
+    /* Last scanout copied into gl_display_buffer. Presents between flips
+     * reuse it so the window thread does not drain the GPU mid-frame. */
+    bool display_cache_valid;
+    int display_cache_flip;
+    hwaddr display_cache_addr;
+    unsigned int display_cache_width;
+    unsigned int display_cache_height;
 
     Lru element_cache;
     VertexLruNode *element_cache_entries;
@@ -238,6 +247,62 @@ typedef struct PGRAPHGLState {
     struct supported_extensions {
         GLboolean texture_filter_anisotropic;
     } supported_extensions;
+
+    /* Fixed-function state last sent on the render context. Cleared when a
+     * clear or surface copy overwrites it. */
+    struct {
+        bool known;
+        bool color_mask[4];
+        bool depth_mask;
+        GLuint stencil_mask;
+        bool blend;
+        GLenum blend_sfactor;
+        GLenum blend_dfactor;
+        GLenum blend_equation;
+        float blend_color[4];
+        bool cull;
+        GLenum cull_face;
+        GLenum front_face;
+        bool offset_fill;
+        bool offset_line;
+        bool offset_point;
+        float offset_factor;
+        float offset_units;
+        bool depth_test;
+        GLenum depth_func;
+        bool depth_clamp;
+        bool provoking_first;
+        bool stencil_test;
+        GLenum stencil_func;
+        GLint stencil_ref;
+        GLuint stencil_read_mask;
+        GLenum stencil_fail;
+        GLenum stencil_zfail;
+        GLenum stencil_zpass;
+        bool dither;
+        bool program_point_size;
+        bool line_smooth;
+        float line_width;
+        bool polygon_smooth;
+        GLint viewport[4];
+        bool scissor_test;
+        GLint scissor[4];
+    } fixed;
+
+    /* Vertex-attrib state on the render VAO. Unused attributes stay disabled
+     * across draws, so the driver call is skipped. */
+    struct {
+        bool set;
+        bool enabled;
+        bool integer;
+        GLint size;
+        GLenum type;
+        GLboolean normalized;
+        GLsizei stride;
+        uintptr_t offset;
+        GLuint buffer;
+        float generic[4];
+    } attrib[NV2A_VERTEXSHADER_ATTRIBUTES];
 } PGRAPHGLState;
 
 extern GloContext *g_nv2a_context_render;

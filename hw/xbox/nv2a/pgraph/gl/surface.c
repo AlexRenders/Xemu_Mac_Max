@@ -270,6 +270,7 @@ static void render_surface_to(NV2AState *d, SurfaceBinding *surface,
     glBindTexture(gl_target, gl_texture);
     glUseProgram(
         r->shader_binding ? r->shader_binding->gl_program : 0);
+    r->fixed.known = false;
 }
 
 static void render_surface_to_texture_slow(NV2AState *d,

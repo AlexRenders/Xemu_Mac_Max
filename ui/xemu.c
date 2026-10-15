@@ -869,8 +869,6 @@ static void gl_render_frame(struct xemu_console *scon)
      */
     GLuint tex = nv2a_get_framebuffer_surface();
 
-    assert(glGetError() == GL_NO_ERROR);
-
     if (tex == 0) {
         xemu_main_loop_lock();
         // FIXME: Don't upload if notdirty
@@ -902,7 +900,9 @@ static void gl_render_frame(struct xemu_console *scon)
     xemu_main_loop_unlock();
 
     xemu_hud_render();
-    glFinish();
+    /* glFinish here waits out the whole GPU queue on Apple's GL, including
+     * the game's draws on the other context. Swap submits this blit. */
+    glFlush();
 
     if (release_surface_texture) {
         xemu_main_loop_lock();
@@ -928,7 +928,6 @@ static void gl_render_frame(struct xemu_console *scon)
 #else
     SDL_GL_SwapWindow(scon->real_window);
 #endif
-    assert(glGetError() == GL_NO_ERROR);
 
     qatomic_set(&rendering, false);
 

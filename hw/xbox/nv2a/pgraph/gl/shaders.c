@@ -519,6 +519,7 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     binding->cached = false;
     binding->program = NULL;
     binding->save_thread = NULL;
+    binding->uniform_cache = NULL;
 }
 
 static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
@@ -538,6 +539,8 @@ static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
     binding->cached = false;
     binding->save_thread = NULL;
     binding->program = NULL;
+    g_free(binding->uniform_cache);
+    binding->uniform_cache = NULL;
     memset(&binding->state, 0, sizeof(ShaderState));
 }
 
@@ -718,8 +721,52 @@ void pgraph_gl_shader_cache_to_disk(ShaderBinding *binding)
     qemu_thread_create(binding->save_thread, name, shader_write_to_disk, binding, QEMU_THREAD_JOINABLE);
 }
 
+typedef struct ShaderUniformCache {
+    bool vsh_valid;
+    bool psh_valid;
+    VshUniformValues vsh;
+    PshUniformValues psh;
+} ShaderUniformCache;
+
+static void upload_uniform_range(const UniformInfo *info, GLint loc,
+                                 GLsizei count, const void *value)
+{
+    switch (info->type) {
+    case UniformElementType_uint:
+        glUniform1uiv(loc, count, value);
+        break;
+    case UniformElementType_int:
+        glUniform1iv(loc, count, value);
+        break;
+    case UniformElementType_ivec2:
+        glUniform2iv(loc, count, value);
+        break;
+    case UniformElementType_ivec4:
+        glUniform4iv(loc, count, value);
+        break;
+    case UniformElementType_float:
+        glUniform1fv(loc, count, value);
+        break;
+    case UniformElementType_vec2:
+        glUniform2fv(loc, count, value);
+        break;
+    case UniformElementType_vec3:
+        glUniform3fv(loc, count, value);
+        break;
+    case UniformElementType_vec4:
+        glUniform4fv(loc, count, value);
+        break;
+    case UniformElementType_mat2:
+        glUniformMatrix2fv(loc, count, GL_FALSE, value);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 static void apply_uniform_updates(const UniformInfo *info, int *locs,
-                                  void *values, size_t count)
+                                  void *values, void *prev, bool *valid,
+                                  size_t count)
 {
     for (int i = 0; i < count; i++) {
         if (locs[i] == -1) {
@@ -727,68 +774,84 @@ static void apply_uniform_updates(const UniformInfo *info, int *locs,
         }
 
         void *value = (char*)values + info[i].val_offs;
+        size_t elem = info[i].size;
+        size_t nbytes = elem * info[i].count;
+        void *prev_value = prev ? (char *)prev + info[i].val_offs : NULL;
 
-        switch (info[i].type) {
-        case UniformElementType_uint:
-            glUniform1uiv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_int:
-            glUniform1iv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_ivec2:
-            glUniform2iv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_ivec4:
-            glUniform4iv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_float:
-            glUniform1fv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_vec2:
-            glUniform2fv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_vec3:
-            glUniform3fv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_vec4:
-            glUniform4fv(locs[i], info[i].count, value);
-            break;
-        case UniformElementType_mat2:
-            glUniformMatrix2fv(locs[i], info[i].count, GL_FALSE, value);
-            break;
-        default:
-            g_assert_not_reached();
+        if (*valid && prev_value && memcmp(prev_value, value, nbytes) == 0) {
+            continue;
+        }
+
+        /* Array elements occupy consecutive locations. A crowd draw usually
+         * changes one matrix inside c[192]; resending the whole block is
+         * what Apple's GL translates into Metal. */
+        if (*valid && prev_value && info[i].count > 1 &&
+            info[i].type != UniformElementType_mat2) {
+            int first = -1;
+            int last = -1;
+            for (size_t e = 0; e < info[i].count; e++) {
+                if (memcmp((char *)prev_value + e * elem,
+                           (char *)value + e * elem, elem) != 0) {
+                    if (first < 0) {
+                        first = (int)e;
+                    }
+                    last = (int)e;
+                }
+            }
+            if (first < 0) {
+                continue;
+            }
+            upload_uniform_range(&info[i], locs[i] + first, last - first + 1,
+                                 (char *)value + (size_t)first * elem);
+            memcpy((char *)prev_value + (size_t)first * elem,
+                   (char *)value + (size_t)first * elem,
+                   (size_t)(last - first + 1) * elem);
+            continue;
+        }
+
+        upload_uniform_range(&info[i], locs[i], (GLsizei)info[i].count, value);
+
+        if (prev_value) {
+            memcpy(prev_value, value, nbytes);
         }
     }
 
-    /* glGetError flushes Apple's OpenGL command stream. This runs once per
-     * draw, so the GPU finishes every draw before the next one is submitted
-     * and resolution stops mattering. */
+    *valid = true;
 }
 
-// FIXME: Dirty tracking
-// FIXME: Consider UBO to align with VK renderer
 static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
 {
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+    if (!binding->uniform_cache) {
+        binding->uniform_cache = g_malloc0(sizeof(ShaderUniformCache));
+    }
+    ShaderUniformCache *cache = binding->uniform_cache;
+
     VshUniformValues vsh_values;
+    memset(&vsh_values, 0, sizeof(vsh_values));
     pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
                                   binding->uniform_locs.vsh, &vsh_values);
     apply_uniform_updates(VshUniformInfo, binding->uniform_locs.vsh,
-                          &vsh_values, VshUniform__COUNT);
+                          &vsh_values, &cache->vsh, &cache->vsh_valid,
+                          VshUniform__COUNT);
 
     PshUniformValues psh_values;
+    memset(&psh_values, 0, sizeof(psh_values));
     pgraph_glsl_set_psh_uniform_values(pg, binding->uniform_locs.psh, &psh_values);
 
+    /* Unbound rect samplers used to keep a 0 scale from the cleared struct.
+     * Sampling then divides by zero and the UVs blow up. 1 is the identity
+     * scale; a real binding overrides it. */
     for (int i = 0; i < 4; i++) {
+        psh_values.texScale[i] = 1.0f;
         if (r->texture_binding[i] != NULL) {
-            float scale = r->texture_binding[i]->scale;
-            psh_values.texScale[i] = scale;
+            psh_values.texScale[i] = r->texture_binding[i]->scale;
         }
     }
     apply_uniform_updates(PshUniformInfo, binding->uniform_locs.psh,
-                          &psh_values, PshUniform__COUNT);
+                          &psh_values, &cache->psh, &cache->psh_valid,
+                          PshUniform__COUNT);
 }
 
 void pgraph_gl_bind_shaders(PGRAPHState *pg)
